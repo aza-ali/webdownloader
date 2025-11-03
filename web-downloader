@@ -1,0 +1,547 @@
+#!/usr/bin/env node
+
+/**
+ * Web Page Downloader - A terminal tool for downloading complete web pages
+ *
+ * Features:
+ * - Downloads HTML, CSS, JavaScript, images, and other assets
+ * - Converts links to local references for offline viewing
+ * - Supports multiple output formats
+ * - Optional conversion to markdown
+ * - Customizable depth for following links
+ * - robots.txt compliance checking
+ */
+
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { URL } = require('url');
+
+class RobotsTxtParser {
+  constructor(robotsTxt, userAgent = '*') {
+    this.userAgent = userAgent;
+    this.rules = this.parse(robotsTxt);
+  }
+
+  parse(robotsTxt) {
+    const rules = {
+      disallow: [],
+      allow: [],
+      crawlDelay: null
+    };
+
+    if (!robotsTxt) return rules;
+
+    const lines = robotsTxt.split('\n');
+    let relevantSection = false;
+    let generalSection = false;
+    const generalRules = { disallow: [], allow: [] };
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      // Skip comments and empty lines
+      if (!trimmed || trimmed.startsWith('#')) continue;
+
+      const [key, ...valueParts] = trimmed.split(':');
+      const value = valueParts.join(':').trim();
+
+      if (key.toLowerCase() === 'user-agent') {
+        // Check if this section applies to our user agent
+        relevantSection = value === this.userAgent || value === '*';
+        if (value === '*') {
+          generalSection = true;
+        } else {
+          generalSection = false;
+        }
+        continue;
+      }
+
+      if (relevantSection) {
+        if (key.toLowerCase() === 'disallow') {
+          if (generalSection) {
+            generalRules.disallow.push(value);
+          } else {
+            rules.disallow.push(value);
+          }
+        } else if (key.toLowerCase() === 'allow') {
+          if (generalSection) {
+            generalRules.allow.push(value);
+          } else {
+            rules.allow.push(value);
+          }
+        } else if (key.toLowerCase() === 'crawl-delay') {
+          rules.crawlDelay = parseInt(value, 10);
+        }
+      }
+    }
+
+    // If no specific rules for our user agent, use general rules
+    if (rules.disallow.length === 0 && rules.allow.length === 0) {
+      rules.disallow = generalRules.disallow;
+      rules.allow = generalRules.allow;
+    }
+
+    return rules;
+  }
+
+  isAllowed(urlPath) {
+    // Check allow rules first (they take precedence)
+    for (const pattern of this.rules.allow) {
+      if (this.matchesPattern(urlPath, pattern)) {
+        return true;
+      }
+    }
+
+    // Check disallow rules
+    for (const pattern of this.rules.disallow) {
+      if (this.matchesPattern(urlPath, pattern)) {
+        return false;
+      }
+    }
+
+    // If no rules match, allow by default
+    return true;
+  }
+
+  matchesPattern(urlPath, pattern) {
+    if (!pattern) return false;
+
+    // Exact match
+    if (pattern === urlPath) return true;
+
+    // Wildcard matching
+    const regexPattern = pattern
+      .replace(/\./g, '\\.')
+      .replace(/\*/g, '.*')
+      .replace(/\?/g, '.');
+
+    const regex = new RegExp('^' + regexPattern);
+    return regex.test(urlPath);
+  }
+
+  getCrawlDelay() {
+    return this.rules.crawlDelay;
+  }
+}
+
+class WebDownloader {
+  constructor(options = {}) {
+    this.options = {
+      outputDir: options.outputDir || './downloaded-site',
+      includeAssets: options.includeAssets !== false,
+      followLinks: options.followLinks || false,
+      maxDepth: options.maxDepth || 1,
+      userAgent: options.userAgent || 'WebDownloader/1.0',
+      timeout: options.timeout || 30000,
+      markdown: options.markdown || false,
+      robotsTxt: options.robotsTxt || 'ignore', // 'obey', 'ignore', 'warn'
+      ...options
+    };
+    this.downloaded = new Set();
+    this.queue = [];
+    this.robotsParsers = new Map(); // Cache robots.txt per domain
+    this.lastCrawlTime = new Map(); // Track last crawl time per domain for crawl-delay
+  }
+
+  async getRobotsParser(origin) {
+    if (this.robotsParsers.has(origin)) {
+      return this.robotsParsers.get(origin);
+    }
+
+    try {
+      const robotsUrl = `${origin}/robots.txt`;
+      console.log(`Fetching robots.txt from: ${robotsUrl}`);
+      const robotsTxt = await this.fetchPage(robotsUrl);
+      const parser = new RobotsTxtParser(robotsTxt, this.options.userAgent);
+      this.robotsParsers.set(origin, parser);
+      return parser;
+    } catch (error) {
+      // If robots.txt doesn't exist, create a permissive parser
+      console.log(`No robots.txt found at ${origin}, allowing all URLs`);
+      const parser = new RobotsTxtParser('', this.options.userAgent);
+      this.robotsParsers.set(origin, parser);
+      return parser;
+    }
+  }
+
+  async checkRobotsTxt(url) {
+    if (this.options.robotsTxt === 'ignore') {
+      return true;
+    }
+
+    const parsedUrl = new URL(url);
+    const origin = parsedUrl.origin;
+    const parser = await this.getRobotsParser(origin);
+    const isAllowed = parser.isAllowed(parsedUrl.pathname);
+
+    if (!isAllowed) {
+      if (this.options.robotsTxt === 'obey') {
+        console.log(`❌ Blocked by robots.txt: ${url}`);
+        return false;
+      } else if (this.options.robotsTxt === 'warn') {
+        console.log(`⚠️  Warning: ${url} is disallowed by robots.txt (downloading anyway)`);
+        return true;
+      }
+    }
+
+    // Handle crawl-delay
+    const crawlDelay = parser.getCrawlDelay();
+    if (crawlDelay) {
+      const lastCrawl = this.lastCrawlTime.get(origin) || 0;
+      const now = Date.now();
+      const timeSinceLastCrawl = now - lastCrawl;
+      const requiredDelay = crawlDelay * 1000;
+
+      if (timeSinceLastCrawl < requiredDelay) {
+        const waitTime = requiredDelay - timeSinceLastCrawl;
+        console.log(`⏱️  Crawl-delay: waiting ${waitTime}ms before downloading from ${origin}`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+
+      this.lastCrawlTime.set(origin, Date.now());
+    }
+
+    return true;
+  }
+
+  async download(url, depth = 0) {
+    try {
+      const parsedUrl = new URL(url);
+
+      if (this.downloaded.has(url) || depth > this.options.maxDepth) {
+        return;
+      }
+
+      // Check robots.txt before downloading
+      const allowed = await this.checkRobotsTxt(url);
+      if (!allowed) {
+        return;
+      }
+
+      this.downloaded.add(url);
+      console.log(`Downloading: ${url}`);
+
+      const html = await this.fetchPage(url);
+
+      if (!html) {
+        console.error(`Failed to download: ${url}`);
+        return;
+      }
+
+      // Save the HTML
+      const filename = this.getFilename(parsedUrl);
+      const filepath = path.join(this.options.outputDir, filename);
+
+      // Create directory if it doesn't exist
+      const dir = path.dirname(filepath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      let processedHtml = html;
+
+      if (this.options.includeAssets) {
+        processedHtml = await this.downloadAssets(html, parsedUrl);
+      }
+
+      if (this.options.markdown) {
+        const markdown = this.convertToMarkdown(processedHtml);
+        fs.writeFileSync(filepath.replace('.html', '.md'), markdown);
+      } else {
+        fs.writeFileSync(filepath, processedHtml);
+      }
+
+      console.log(`Saved: ${filepath}`);
+
+      // Follow links if enabled
+      if (this.options.followLinks && depth < this.options.maxDepth) {
+        const links = this.extractLinks(html, parsedUrl);
+        for (const link of links) {
+          await this.download(link, depth + 1);
+        }
+      }
+
+    } catch (error) {
+      console.error(`Error downloading ${url}:`, error.message);
+    }
+  }
+
+  fetchPage(url) {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
+      const options = {
+        headers: {
+          'User-Agent': this.options.userAgent,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+        },
+        timeout: this.options.timeout
+      };
+
+      protocol.get(url, options, (response) => {
+        // Handle redirects
+        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          const redirectUrl = new URL(response.headers.location, url).href;
+          console.log(`Redirecting to: ${redirectUrl}`);
+          return resolve(this.fetchPage(redirectUrl));
+        }
+
+        if (response.statusCode !== 200) {
+          return reject(new Error(`HTTP ${response.statusCode}`));
+        }
+
+        let data = '';
+        response.on('data', chunk => data += chunk);
+        response.on('end', () => resolve(data));
+      }).on('error', reject);
+    });
+  }
+
+  async downloadAssets(html, baseUrl) {
+    const assetRegex = /(href|src)=["']([^"']+)["']/g;
+    let match;
+    const assets = [];
+
+    while ((match = assetRegex.exec(html)) !== null) {
+      const assetUrl = match[2];
+      if (!assetUrl.startsWith('data:') && !assetUrl.startsWith('javascript:')) {
+        try {
+          const fullUrl = new URL(assetUrl, baseUrl).href;
+          if (fullUrl.startsWith(baseUrl.origin)) {
+            assets.push({ original: assetUrl, full: fullUrl });
+          }
+        } catch (e) {
+          // Invalid URL, skip
+        }
+      }
+    }
+
+    // Download each asset
+    for (const asset of assets) {
+      try {
+        const content = await this.fetchPage(asset.full);
+        const filename = this.getFilename(new URL(asset.full));
+        const filepath = path.join(this.options.outputDir, filename);
+
+        const dir = path.dirname(filepath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+
+        fs.writeFileSync(filepath, content);
+        console.log(`Downloaded asset: ${filename}`);
+
+        // Update HTML to reference local file
+        html = html.replace(asset.original, filename);
+      } catch (e) {
+        console.error(`Failed to download asset: ${asset.full}`, e.message);
+      }
+    }
+
+    return html;
+  }
+
+  extractLinks(html, baseUrl) {
+    const linkRegex = /href=["']([^"']+)["']/g;
+    const links = new Set();
+    let match;
+
+    while ((match = linkRegex.exec(html)) !== null) {
+      const link = match[1];
+      if (!link.startsWith('#') && !link.startsWith('javascript:') && !link.startsWith('mailto:')) {
+        try {
+          const fullUrl = new URL(link, baseUrl).href;
+          if (fullUrl.startsWith(baseUrl.origin)) {
+            links.add(fullUrl);
+          }
+        } catch (e) {
+          // Invalid URL, skip
+        }
+      }
+    }
+
+    return Array.from(links);
+  }
+
+  getFilename(url) {
+    let pathname = url.pathname;
+    if (pathname === '/' || pathname === '') {
+      return 'index.html';
+    }
+    if (!path.extname(pathname)) {
+      pathname += '/index.html';
+    }
+    return pathname.replace(/^\//, '');
+  }
+
+  convertToMarkdown(html) {
+    // Simple HTML to Markdown conversion
+    let markdown = html;
+
+    // Remove script and style tags
+    markdown = markdown.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+    markdown = markdown.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
+
+    // Convert headers
+    markdown = markdown.replace(/<h1[^>]*>(.*?)<\/h1>/gi, '# $1\n');
+    markdown = markdown.replace(/<h2[^>]*>(.*?)<\/h2>/gi, '## $1\n');
+    markdown = markdown.replace(/<h3[^>]*>(.*?)<\/h3>/gi, '### $1\n');
+    markdown = markdown.replace(/<h4[^>]*>(.*?)<\/h4>/gi, '#### $1\n');
+
+    // Convert links
+    markdown = markdown.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+
+    // Convert images
+    markdown = markdown.replace(/<img[^>]*src=["']([^"']+)["'][^>]*alt=["']([^"']*)["'][^>]*>/gi, '![$2]($1)');
+
+    // Convert bold and italic
+    markdown = markdown.replace(/<strong[^>]*>(.*?)<\/strong>/gi, '**$1**');
+    markdown = markdown.replace(/<b[^>]*>(.*?)<\/b>/gi, '**$1**');
+    markdown = markdown.replace(/<em[^>]*>(.*?)<\/em>/gi, '*$1*');
+    markdown = markdown.replace(/<i[^>]*>(.*?)<\/i>/gi, '*$1*');
+
+    // Convert paragraphs
+    markdown = markdown.replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n');
+
+    // Convert line breaks
+    markdown = markdown.replace(/<br\s*\/?>/gi, '\n');
+
+    // Remove remaining HTML tags
+    markdown = markdown.replace(/<[^>]+>/g, '');
+
+    // Decode HTML entities
+    markdown = markdown.replace(/&nbsp;/g, ' ');
+    markdown = markdown.replace(/&lt;/g, '<');
+    markdown = markdown.replace(/&gt;/g, '>');
+    markdown = markdown.replace(/&amp;/g, '&');
+    markdown = markdown.replace(/&quot;/g, '"');
+
+    return markdown.trim();
+  }
+}
+
+// CLI Interface
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const options = {
+    urls: [],
+    outputDir: './downloaded-site',
+    includeAssets: true,
+    followLinks: false,
+    maxDepth: 1,
+    markdown: false,
+    robotsTxt: 'ignore',
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (arg === '-h' || arg === '--help') {
+      printHelp();
+      process.exit(0);
+    } else if (arg === '-o' || arg === '--output') {
+      options.outputDir = args[++i];
+    } else if (arg === '--no-assets') {
+      options.includeAssets = false;
+    } else if (arg === '-f' || arg === '--follow-links') {
+      options.followLinks = true;
+    } else if (arg === '-d' || arg === '--depth') {
+      options.maxDepth = parseInt(args[++i], 10);
+    } else if (arg === '-m' || arg === '--markdown') {
+      options.markdown = true;
+    } else if (arg === '-r' || arg === '--robots') {
+      const robotsOption = args[++i];
+      if (['obey', 'ignore', 'warn'].includes(robotsOption)) {
+        options.robotsTxt = robotsOption;
+      } else {
+        console.error(`Invalid robots.txt option: ${robotsOption}. Use: obey, ignore, or warn`);
+        process.exit(1);
+      }
+    } else if (!arg.startsWith('-')) {
+      options.urls.push(arg);
+    }
+  }
+
+  return options;
+}
+
+function printHelp() {
+  console.log(`
+Web Page Downloader - Download complete web pages with all assets
+
+USAGE:
+  web-downloader [OPTIONS] <URL>...
+
+OPTIONS:
+  -h, --help              Show this help message
+  -o, --output <dir>      Output directory (default: ./downloaded-site)
+  --no-assets             Don't download CSS, JS, images, etc.
+  -f, --follow-links      Follow and download linked pages
+  -d, --depth <n>         Maximum depth for following links (default: 1)
+  -m, --markdown          Convert HTML to Markdown
+  -r, --robots <mode>     How to handle robots.txt (default: ignore)
+                          ignore - Completely ignore robots.txt
+                          obey   - Respect robots.txt rules (skip blocked URLs)
+                          warn   - Show warnings but download anyway
+
+EXAMPLES:
+  # Download a single page with all assets
+  web-downloader https://example.com
+
+  # Download and convert to markdown
+  web-downloader -m https://example.com/article
+
+  # Download a site with linked pages (max depth 2)
+  web-downloader -f -d 2 -o ./my-site https://example.com
+
+  # Download multiple pages
+  web-downloader https://example.com/page1 https://example.com/page2
+
+  # Download page without assets
+  web-downloader --no-assets https://example.com
+
+  # Ignore robots.txt restrictions
+  web-downloader -r ignore https://example.com
+
+  # Show warnings for robots.txt violations but continue
+  web-downloader -r warn -f https://example.com
+`);
+}
+
+// Main execution
+async function main() {
+  const options = parseArgs();
+
+  if (options.urls.length === 0) {
+    console.error('Error: No URL provided');
+    printHelp();
+    process.exit(1);
+  }
+
+  console.log('Web Page Downloader');
+  console.log('===================\n');
+
+  const downloader = new WebDownloader(options);
+
+  for (const url of options.urls) {
+    try {
+      console.log(`\nStarting download: ${url}`);
+      await downloader.download(url);
+    } catch (error) {
+      console.error(`Failed to download ${url}:`, error.message);
+    }
+  }
+
+  console.log('\n✓ Download complete!');
+  console.log(`Files saved to: ${path.resolve(options.outputDir)}`);
+}
+
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+module.exports = WebDownloader;

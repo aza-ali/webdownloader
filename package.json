@@ -1,0 +1,40 @@
+{
+  "name": "web-downloader-cli",
+  "version": "1.0.0",
+  "description": "A terminal tool for downloading complete web pages with all assets for offline viewing",
+  "main": "web-downloader",
+  "bin": {
+    "web-downloader": "./web-downloader"
+  },
+  "scripts": {
+    "test": "node web-downloader --help"
+  },
+  "keywords": [
+    "web",
+    "downloader",
+    "scraper",
+    "offline",
+    "html",
+    "assets",
+    "crawler",
+    "cli",
+    "tool",
+    "markdown",
+    "robots.txt"
+  ],
+  "author": "Mourtaza Ali",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aza-ali/webdownloader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aza-ali/webdownloader/issues"
+  },
+  "engines": {
+    "node": ">=12.0.0"
+  },
+  "files": [
+    "web-downloader"
+  ]
+}
