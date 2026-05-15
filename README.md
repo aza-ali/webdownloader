@@ -1,19 +1,25 @@
 # Web Downloader CLI
 
-A powerful terminal tool for downloading complete web pages with all their assets for offline viewing.
+[![npm version](https://img.shields.io/npm/v/web-downloader-cli?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/web-downloader-cli)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D14-43853d?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
+
+A terminal tool for archiving complete web pages (HTML, CSS, JavaScript, images, fonts) for offline viewing or markdown export.
+
+`wget` grabs the file. `curl` fetches the bytes. `web-downloader` captures the **whole page**: rewrites links to local paths, follows the asset graph, and ships you a working offline copy or a clean markdown export.
 
 ## Features
 
 - Downloads HTML, CSS, JavaScript, images, and other assets
-- Converts links to local references for offline viewing
-- Supports multiple output formats
-- Optional conversion to markdown
-- Customizable depth for following links
-- robots.txt compliance checking (obey, warn, or ignore)
+- Rewrites links to local references so pages work offline
+- Optional conversion to Markdown
+- Configurable depth for following links
+- `robots.txt` modes: obey, warn, or ignore
 - Follows redirects automatically
-- Respects crawl-delay directives
+- Respects `crawl-delay` directives
+- Programmatic API for use as a Node.js module
 
-## Installation
+## Install
 
 ```bash
 npm install -g web-downloader-cli
@@ -21,10 +27,7 @@ npm install -g web-downloader-cli
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Download a single page with all assets
 web-downloader https://example.com
 ```
 
@@ -33,44 +36,39 @@ web-downloader https://example.com
 ```
   -h, --help              Show help message
   -o, --output <dir>      Output directory (default: ./downloaded-site)
-  --no-assets             Don't download CSS, JS, images, etc.
+  --no-assets             Skip CSS, JS, images, and other assets
   -f, --follow-links      Follow and download linked pages
-  -d, --depth <n>         Maximum depth for following links (default: 1)
+  -d, --depth <n>         Maximum link-follow depth (default: 1)
   -m, --markdown          Convert HTML to Markdown
   -r, --robots <mode>     How to handle robots.txt (default: ignore)
-                          ignore - Completely ignore robots.txt
-                          obey   - Respect robots.txt rules (skip blocked URLs)
-                          warn   - Show warnings but download anyway
+                          ignore - skip robots.txt entirely
+                          obey   - respect rules, skip blocked URLs
+                          warn   - warn but proceed
 ```
 
 ### Examples
 
 ```bash
-# Download a single page with all assets
+# Single page with all assets
 web-downloader https://example.com
 
-# Download and convert to markdown
+# Convert to Markdown
 web-downloader -m https://example.com/article
 
-# Download a site with linked pages (max depth 2)
+# Follow linked pages, depth 2, custom output
 web-downloader -f -d 2 -o ./my-site https://example.com
 
-# Download multiple pages
+# Multiple pages in one run
 web-downloader https://example.com/page1 https://example.com/page2
 
-# Download page without assets
+# HTML only, skip assets
 web-downloader --no-assets https://example.com
 
-# Respect robots.txt restrictions
+# Respect robots.txt
 web-downloader -r obey -f https://example.com
-
-# Show warnings for robots.txt violations but continue
-web-downloader -r warn -f https://example.com
 ```
 
-## Use as a Module
-
-You can also use this tool programmatically in your Node.js projects:
+## Programmatic API
 
 ```javascript
 const WebDownloader = require('web-downloader-cli');
@@ -87,14 +85,20 @@ const downloader = new WebDownloader({
 downloader.download('https://example.com');
 ```
 
+## When to use what
+
+| You want to... | Reach for |
+|---|---|
+| Download a single file | `curl` or `wget` |
+| Mirror a static site | `wget --mirror` |
+| Save one page to read offline (with images, working CSS) | **`web-downloader`** |
+| Save a page as Markdown for LLM ingestion | **`web-downloader -m`** |
+| Crawl a JS-heavy site | A real browser tool (Playwright, Puppeteer) |
+
 ## License
 
 MIT
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Issues
-
-If you encounter any problems, please file an issue on GitHub.
+PRs welcome. Open an issue first for anything substantial.
